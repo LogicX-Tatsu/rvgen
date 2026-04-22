@@ -1,0 +1,285 @@
+"""Command-line entry point — lightweight port of ``run.py``.
+
+For Phase 1 the CLI exposes the generation pipeline only (``--steps gen``).
+GCC / ISS / iss_cmp integration comes in a later step.
+
+Example::
+
+    python -m chipforge_inst_gen --target rv32imc \\
+        --test riscv_arithmetic_basic_test --iterations 2 --steps gen \\
+        --output out/
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
+from chipforge_inst_gen.config import make_config
+from chipforge_inst_gen.seeding import SeedGen
+from chipforge_inst_gen.targets import get_target, target_names
+from chipforge_inst_gen.testlist import load_testlist
+
+
+_LOG = logging.getLogger("chipforge_inst_gen.cli")
+
+
+# Default testlist / riscv_dv_root can be overridden per environment.
+_DEFAULT_RISCV_DV_ROOT = Path.home() / "Desktop" / "verif_env_tatsu" / "riscv-dv"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="chipforge-inst-gen",
+        description="Pure-Python re-implementation of riscv-dv — CLI.",
+    )
+    # Test selection
+    p.add_argument("--target", default="rv32imc", choices=target_names(),
+                   help="Target processor configuration (default: rv32imc).")
+    p.add_argument("-tl", "--testlist", default="",
+                   help="Path to a regression testlist YAML. "
+                        "Defaults to <riscv_dv_root>/target/<target>/testlist.yaml.")
+    p.add_argument("-tn", "--test", default="all",
+                   help="Comma-separated test names, or 'all'.")
+    p.add_argument("-i", "--iterations", type=int, default=0,
+                   help="Override the testlist iterations count (0 = use yaml).")
+
+    # Seeding (mutually exclusive)
+    seed_group = p.add_mutually_exclusive_group()
+    seed_group.add_argument("--seed", type=int, default=None,
+                            help="Fixed seed for every test (implies iterations=1).")
+    seed_group.add_argument("--start_seed", type=int, default=None,
+                            help="Starting seed; increments by iteration.")
+    seed_group.add_argument("--seed_yaml", type=str, default=None,
+                            help="Replay seeds from a previously-saved seed.yaml.")
+
+    # Flow control
+    p.add_argument("-s", "--steps", default="all",
+                   help="Comma-separated: gen,gcc_compile,iss_sim,iss_cmp, or 'all'.")
+    p.add_argument("-o", "--output", default="",
+                   help="Output directory (default: out_<date>).")
+    p.add_argument("--noclean", action="store_true", default=True,
+                   help="Do not clean the output of previous runs (default: true, same as run.py).")
+
+    # ISA
+    p.add_argument("--isa", default="",
+                   help="ISA string override (inferred from target when empty).")
+    p.add_argument("-m", "--mabi", default="",
+                   help="ABI override (inferred from target when empty).")
+
+    # ISS / GCC
+    p.add_argument("--iss", default="spike",
+                   help="ISS to run (Phase 1: 'spike' only).")
+    p.add_argument("--iss_timeout", type=int, default=30,
+                   help="ISS timeout in seconds (default 30).")
+    p.add_argument("--priv", default="m",
+                   help="Privilege modes string for ISS (m/s/u/su).")
+    p.add_argument("--gcc_opts", default="",
+                   help="Extra options passed to riscv-gcc.")
+    p.add_argument("--gen_opts", default="",
+                   help="Plus-arg string appended to every test's gen_opts, "
+                        "e.g. '+bare_program_mode=1 +no_csr_instr=1' for rv32ui.")
+
+    # Paths / roots
+    p.add_argument("--riscv_dv_root", type=str, default=str(_DEFAULT_RISCV_DV_ROOT),
+                   help="Root directory of riscv-dv for <riscv_dv_root> substitution in testlists.")
+
+    # Verbose / debug
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Enable debug logging.")
+    p.add_argument("-d", "--debug", type=str, default="",
+                   help="Write the generated commands to this file without executing them.")
+    return p
+
+
+def _infer_testlist_path(target: str, riscv_dv_root: Path) -> Path:
+    return riscv_dv_root / "target" / target / "testlist.yaml"
+
+
+def _infer_output(out: str) -> Path:
+    if out:
+        return Path(out)
+    from datetime import date
+    return Path(f"out_{date.today().isoformat()}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    riscv_dv_root = Path(args.riscv_dv_root)
+    if not riscv_dv_root.exists():
+        _LOG.warning("riscv_dv_root %s does not exist; testlist imports may fail", riscv_dv_root)
+
+    testlist_path = Path(args.testlist) if args.testlist else _infer_testlist_path(args.target, riscv_dv_root)
+    output_dir = _infer_output(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    asm_dir = output_dir / "asm_test"
+    asm_dir.mkdir(exist_ok=True)
+
+    target_cfg = get_target(args.target)
+
+    # Build the seed generator. --seed forces iterations=1 (run.py semantics).
+    if args.seed is not None:
+        if args.iterations > 1:
+            _LOG.error("--seed is incompatible with --iterations > 1")
+            return 1
+        seed_gen = SeedGen(fixed_seed=args.seed)
+        iteration_override = 1
+    elif args.seed_yaml is not None:
+        seed_gen = SeedGen.from_yaml(args.seed_yaml)
+        iteration_override = args.iterations
+    else:
+        seed_gen = SeedGen(start_seed=args.start_seed)
+        iteration_override = args.iterations
+
+    # Load the testlist.
+    tests = load_testlist(
+        testlist_path,
+        riscv_dv_root=riscv_dv_root,
+        test_filter=args.test,
+        iteration_override=iteration_override,
+    )
+    if not tests:
+        _LOG.error("No tests matched %r in %s", args.test, testlist_path)
+        return 1
+
+    steps = set(args.steps.split(",")) if args.steps != "all" else {"gen", "gcc_compile", "iss_sim", "iss_cmp"}
+
+    import random
+
+    from chipforge_inst_gen.isa import enums  # noqa: F401 — ensure ISA modules imported
+    from chipforge_inst_gen.isa.filtering import create_instr_list
+    from chipforge_inst_gen.asm_program_gen import AsmProgramGen
+
+    seen_seeds: dict[str, int] = {}
+    if "gen" in steps:
+        for te in tests:
+            for it in range(te.iterations):
+                test_id = f"{te.test}_{it}"
+                seed = seed_gen.get(test_id, it)
+                seen_seeds[test_id] = seed
+
+                merged_gen_opts = (te.gen_opts or "") + " " + (args.gen_opts or "")
+                cfg = make_config(target_cfg, gen_opts=merged_gen_opts)
+                cfg.seed = seed
+
+                avail = create_instr_list(cfg)
+                rng = random.Random(seed)
+
+                gen = AsmProgramGen(cfg=cfg, avail=avail, rng=rng)
+                lines = gen.gen_program()
+
+                asm_path = asm_dir / f"{te.test}_{it}.S"
+                asm_path.write_text("\n".join(lines) + "\n")
+                _LOG.info("Generated %s (seed=%d, %d lines)",
+                          asm_path, seed, len(lines))
+
+    if seen_seeds:
+        seed_gen.dump(output_dir / "seed.yaml", seen_seeds)
+        _LOG.info("Saved %d seeds to %s", len(seen_seeds), output_dir / "seed.yaml")
+
+    # ---- Optional gcc_compile / iss_sim passes ----
+    gcc_results: list = []
+    if "gcc_compile" in steps:
+        from chipforge_inst_gen.gcc import default_link_script, gcc_compile
+        isa = args.isa or _infer_isa(args.target)
+        mabi = args.mabi or _infer_mabi(args.target)
+        link_script = default_link_script(output_dir)
+        gcc_results = gcc_compile(
+            tests,
+            output_dir=output_dir,
+            riscv_dv_root=riscv_dv_root,
+            isa=isa,
+            mabi=mabi,
+            extra_gcc_opts=args.gcc_opts,
+            link_script=link_script,
+        )
+        fails = [r for r in gcc_results if r.returncode != 0]
+        if fails:
+            _LOG.error("%d/%d tests failed to compile", len(fails), len(gcc_results))
+            for r in fails:
+                _LOG.error("  %s", r.test_id)
+
+    if "iss_sim" in steps and gcc_results:
+        from chipforge_inst_gen.iss import run_iss
+        isa = args.isa or _infer_isa(args.target)
+        iss_results = run_iss(
+            args.iss,
+            [r for r in gcc_results if r.returncode == 0],
+            output_dir=output_dir,
+            isa=isa,
+            priv=args.priv,
+            timeout_s=args.iss_timeout,
+        )
+        fails = [r for r in iss_results if r.returncode != 0]
+        if fails:
+            _LOG.error("%d/%d tests failed ISS sim", len(fails), len(iss_results))
+            for r in fails:
+                _LOG.error("  %s (rc=%d)", r.test_id, r.returncode)
+            return 2
+        _LOG.info("%d tests passed ISS sim", len(iss_results))
+
+    return 0
+
+
+# Target → (isa, mabi) mapping matching run.py::load_config's dispatch.
+_TARGET_ISA_MABI: dict[str, tuple[str, str]] = {
+    "rv32i": ("rv32i_zicsr_zifencei", "ilp32"),
+    # rv32ui: pure user-mode RV32I, NO zicsr / zifencei (core has no CSRs).
+    "rv32ui": ("rv32i", "ilp32"),
+    # rv32imc_zkn: RV32IMC + ratified Zkn crypto umbrella (chipforge MCU ISA).
+    "rv32imc_zkn": ("rv32imc_zbkb_zbkc_zbkx_zknd_zkne_zknh_zicsr_zifencei", "ilp32"),
+    # Full-crypto rv32 target used for stress regressions.
+    "rv32imc_zkn_zks": (
+        "rv32imc_zba_zbb_zbc_zbs_zbkb_zbkc_zbkx_zkn_zks_zicsr_zifencei",
+        "ilp32",
+    ),
+    # RV64 crypto baseline.
+    "rv64imc_zkn": ("rv64imc_zbkb_zbkc_zbkx_zkn_zicsr_zifencei", "lp64"),
+    "rv32im": ("rv32im_zicsr_zifencei", "ilp32"),
+    "rv32ic": ("rv32ic_zicsr_zifencei", "ilp32"),
+    "rv32ia": ("rv32ia_zicsr_zifencei", "ilp32"),
+    "rv32iac": ("rv32iac_zicsr_zifencei", "ilp32"),
+    "rv32imac": ("rv32imac_zicsr_zifencei", "ilp32"),
+    "rv32imafdc": ("rv32imafdc_zicsr_zifencei", "ilp32d"),
+    "rv32if": ("rv32if_zicsr_zifencei", "ilp32f"),
+    "rv32imcb": ("rv32imc_zba_zbb_zbc_zbs_zicsr_zifencei", "ilp32"),
+    "rv32imc": ("rv32imc_zicsr_zifencei", "ilp32"),
+    "rv32imc_sv32": ("rv32imc_zicsr_zifencei", "ilp32"),
+    "multi_harts": ("rv32gc_zicsr_zifencei", "ilp32"),
+    "rv64imc": ("rv64imc_zicsr_zifencei", "lp64"),
+    "rv64imcb": ("rv64imc_zba_zbb_zbc_zbs_zicsr_zifencei", "lp64"),
+    "rv64gc": ("rv64gc_zicsr_zifencei", "lp64"),
+    "rv64gcv": ("rv64gcv_zicsr_zifencei", "lp64"),
+    "rv64imafdc": ("rv64imafdc_zicsr_zifencei", "lp64"),
+    "ml": ("rv64imc_zicsr_zifencei", "lp64"),
+}
+
+
+def _infer_isa(target: str) -> str:
+    try:
+        return _TARGET_ISA_MABI[target][0]
+    except KeyError:
+        raise SystemExit(f"Cannot infer ISA for target {target!r}; pass --isa.")
+
+
+def _infer_mabi(target: str) -> str:
+    try:
+        return _TARGET_ISA_MABI[target][1]
+    except KeyError:
+        raise SystemExit(f"Cannot infer mabi for target {target!r}; pass --mabi.")
+
+
+# _emit_wrapped_asm removed — AsmProgramGen now emits the full program.
+
+
+if __name__ == "__main__":
+    sys.exit(main())

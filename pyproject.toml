@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chipforge_inst_gen"
+version = "0.0.1"
+description = "Pure-Python re-implementation of riscv-dv random instruction generator."
+requires-python = ">=3.11"
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+chipforge-inst-gen = "chipforge_inst_gen.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["chipforge_inst_gen*"]
+exclude = ["tests*", "research*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -190,6 +190,28 @@ def test_help_streams_lists_builtins(capsys):
     assert "directed_instr_N" in out
 
 
+def test_help_streams_surfaces_banned_by_and_writes_csrs(capsys):
+    """The discoverability output must surface each stream's
+    BANNED_BY and WRITES_CSRS metadata so verification engineers can
+    see knob conflicts and CSR side-effects without reading source."""
+    from rvgen.cli import main
+    rc = main(["--help_streams"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # Column headers.
+    assert "DROPPED BY" in out
+    assert "WRITES CSRS" in out
+    # Known leaky-stream pinnings — derived from the two-week audit.
+    assert "riscv_loop_instr" in out
+    assert "no_branch_jump" in out             # loop / jal / jalr drop knob
+    assert "no_load_store" in out              # LS / AMO / vector-LS family
+    assert "VSTART" in out                     # vstart_corner writes
+    assert "VTYPE,VL" in out or ("VTYPE" in out and "VL" in out)
+    # Legend explains what each column means.
+    assert "BANNED_BY" in out
+    assert "include_write_reg" in out
+
+
 def test_help_streams_shows_user_streams(tmp_path, capsys, monkeypatch):
     """A registered user stream under rvgen_user_streams.* appears in a
     separate ``User-area streams:`` section."""

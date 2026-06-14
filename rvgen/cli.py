@@ -541,21 +541,37 @@ def main(argv: list[str] | None = None) -> int:
         print("Registered directed streams "
               f"(reference as +directed_instr_N=<name>,<cnt>):")
         print()
+        print(f"  {'NAME':<48s}  {'DROPPED BY':<28s}  {'WRITES CSRS':<16s}  MODULE")
+        print(f"  {'-'*48}  {'-'*28}  {'-'*16}  {'-'*30}")
         builtin = []
         user = []
         for name in sorted(STREAM_REGISTRY):
-            mod = STREAM_REGISTRY[name].__module__
+            cls = STREAM_REGISTRY[name]
+            mod = cls.__module__
+            # BANNED_BY → "cfg.no_X is set ⇒ stream dropped". Empty for
+            # streams without any class-level declaration.
+            banned = ",".join(getattr(cls, "BANNED_BY", ()) or ())
+            # WRITES_CSRS → "stream emits writes to these CSRs as a side
+            # effect" — relevant against +include_write_reg whitelist.
+            writes = ",".join(getattr(cls, "WRITES_CSRS", ()) or ())
+            row = (name, banned or "—", writes or "—", mod)
             if mod.startswith("rvgen_user_streams."):
-                user.append((name, mod))
+                user.append(row)
             else:
-                builtin.append((name, mod))
-        for name, mod in builtin:
-            print(f"  {name:<48s}  {mod}")
+                builtin.append(row)
+        for name, banned, writes, mod in builtin:
+            print(f"  {name:<48s}  {banned:<28s}  {writes:<16s}  {mod}")
         if user:
             print()
             print("User-area streams:")
-            for name, mod in user:
-                print(f"  {name:<48s}  {mod}")
+            for name, banned, writes, mod in user:
+                print(f"  {name:<48s}  {banned:<28s}  {writes:<16s}  {mod}")
+        print()
+        print("Legend: DROPPED BY lists cfg.no_* knobs that veto the "
+              "stream (declared via the class-level BANNED_BY ClassVar).")
+        print("        WRITES CSRS lists CSRs the stream emits writes "
+              "to as a side effect — extend +include_write_reg= to "
+              "whitelist them for tracking.")
         return 0
 
     if args.help_tests:
